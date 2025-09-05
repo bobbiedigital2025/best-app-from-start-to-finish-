@@ -1,0 +1,38 @@
+name: Nightly — Health & Quality
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: 'pnpm' }
+      - run: pnpm i
+      - run: pnpm audit --prod || true
+
+  lighthouse:
+    runs-on: ubuntu-latest
+    if: ${{ vars.DEPLOY_TARGET != 'none' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          npm i -g @lhci/cli
+          lhci autorun || true
+
+  container_scan:
+    runs-on: ubuntu-latest
+    if: ${{ vars.DEPLOY_TARGET == 'docker' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          format: table
+          exit-code: '0'

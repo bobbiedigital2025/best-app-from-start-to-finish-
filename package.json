@@ -1,0 +1,14 @@
+{
+  "name": "best-app-from-start-to-finish-",
+  "version": "1.0.0",
+  "description": "Starter Node.js app for automation pipeline.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "lint": "echo 'No linting configured.'",
+    "test": "echo 'No tests configured.'",
+    "build": "echo 'No build step needed.'"
+  },
+  "author": "bobbiedigital2025",
+  "license": "MIT"
+}

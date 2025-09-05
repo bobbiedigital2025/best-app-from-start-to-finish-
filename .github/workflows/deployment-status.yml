@@ -1,0 +1,25 @@
+name: Deployment Status
+
+on:
+  deployment_status:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    if: github.event.deployment_status.state == 'success'
+    steps:
+      - name: Deployment Success Notification
+        run: |
+          echo "🚀 Deployment successful!"
+          echo "Environment: ${{ github.event.deployment.environment }}"
+          echo "URL: ${{ github.event.deployment_status.target_url }}"
+      
+      - name: Update deployment badge
+        run: |
+          echo "![Deployment Status](https://img.shields.io/badge/deployment-success-brightgreen)" > deployment-status.md
+          
+      - name: Ping health check (if URL available)
+        run: |
+          if [ -n "${{ github.event.deployment_status.target_url }}" ]; then
+            curl -f "${{ github.event.deployment_status.target_url }}" || echo "Health check failed"
+          fi

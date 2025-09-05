@@ -1,0 +1,193 @@
+name: PR CI — Auto Review, Build & Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  NODE_VERSION: ${{ vars.NODE_VERSION || '20' }}
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    outputs:
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+      has_tests: ${{ steps.detect.outputs.has_tests }}
+      framework: ${{ steps.detect.outputs.framework }}
+      package_manager: ${{ steps.detect.outputs.package_manager }}
+      has_supabase: ${{ steps.detect.outputs.has_supabase }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          echo "🔎 Classifying repo..."
+          has_node=false
+          has_docker=false
+          has_tests=false
+          framework=generic
+          package_manager=pnpm
+          has_supabase=false
+
+          # Node detection
+          if [ -f package.json ]; then has_node=true; fi
+          if [ -f pnpm-lock.yaml ]; then package_manager=pnpm; fi
+          if [ -f yarn.lock ]; then package_manager=yarn; fi
+          if [ -f package-lock.json ]; then package_manager=npm; fi
+
+          # Framework heuristics
+          if grep -q 'next\s*:' package.json 2>/dev/null; then framework=next; fi
+          if grep -q 'vite\s*:' package.json 2>/dev/null; then framework=vite; fi
+          if grep -q 'react-scripts' package.json 2>/dev/null; then framework=react; fi
+
+          # Tests
+          if [ -d tests ] || [ -d __tests__ ] || grep -q 'vitest\|jest' package.json 2>/dev/null; then has_tests=true; fi
+
+          # Docker & Supabase
+          if [ -f Dockerfile ]; then has_docker=true; fi
+          if [ -d supabase ] || [ -f drizzle.config.ts ] || [ -f prisma/schema.prisma ]; then has_supabase=true; fi
+
+          echo "has_node=$has_node" >> $GITHUB_OUTPUT
+          echo "has_docker=$has_docker" >> $GITHUB_OUTPUT
+          echo "has_tests=$has_tests" >> $GITHUB_OUTPUT
+          echo "framework=$framework" >> $GITHUB_OUTPUT
+          echo "package_manager=$package_manager" >> $GITHUB_OUTPUT
+          echo "has_supabase=$has_supabase" >> $GITHUB_OUTPUT
+
+  audit_build:
+    runs-on: ubuntu-latest
+    needs: classify
+    if: needs.classify.outputs.has_node == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup PNPM
+        if: needs.classify.outputs.package_manager == 'pnpm'
+        uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ needs.classify.outputs.package_manager }}
+      - name: Install
+        run: |
+          if [ "${{ needs.classify.outputs.package_manager }}" = "pnpm" ]; then pnpm i --frozen-lockfile; \
+          elif [ "${{ needs.classify.outputs.package_manager }}" = "yarn" ]; then yarn --frozen-lockfile; \
+          else npm ci; fi
+      - name: Lint
+        run: |
+          npm run lint || echo "No lint script; skipping"
+      - name: Unit tests
+        if: needs.classify.outputs.has_tests == 'true'
+        run: npm test --if-present --silent
+      - name: Build
+        run: npm run build --if-present
+
+      # Secret scanning (fast)
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: "detect --source . --no-git -v --redact"
+
+      # Upload build
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: |
+            .next
+            dist
+            build
+            out
+          if-no-files-found: ignore
+
+  preview:
+    runs-on: ubuntu-latest
+    needs: [classify, audit_build]
+    if: ${{ vars.ON_PUSH_PREVIEW == 'true' }}
+    env:
+      DEPLOY_TARGET: ${{ vars.DEPLOY_TARGET || 'none' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: ./.ci_artifacts
+
+      - name: Vercel Pull
+        if: env.DEPLOY_TARGET == 'vercel'
+        run: npx vercel pull --yes --token ${{ secrets.VERCEL_TOKEN }}
+      - name: Vercel Build
+        if: env.DEPLOY_TARGET == 'vercel'
+        run: npx vercel build --token ${{ secrets.VERCEL_TOKEN }} || echo "Using project build output"
+      - name: Vercel Deploy (Preview)
+        if: env.DEPLOY_TARGET == 'vercel'
+        id: vercel
+        run: |
+          URL=$(npx vercel deploy --prebuilt --token ${{ secrets.VERCEL_TOKEN }} --yes)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Netlify Deploy (Preview)
+        if: env.DEPLOY_TARGET == 'netlify'
+        id: netlify
+        run: |
+          npm i -g netlify-cli
+          URL=$(netlify deploy --auth ${{ secrets.NETLIFY_AUTH_TOKEN }} --site ${{ secrets.NETLIFY_SITE_ID }} --json | jq -r '.deploy_url')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Azure Web App Deploy (Preview)
+        if: env.DEPLOY_TARGET == 'azure'
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE }}
+          package: .
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const vercel = core.getInput('vercel_url') || (core.getState('url') ?? '')
+            const url = (process.env.DEPLOY_TARGET === 'vercel') ? `${{ steps.vercel.outputs.url }}` : (process.env.DEPLOY_TARGET === 'netlify') ? `${{ steps.netlify.outputs.url }}` : ''
+            const body = [
+              '✅ **CI passed** (lint/tests/build).',
+              url ? `🔗 **Preview:** ${url}` : 'ℹ️ Preview skipped or not configured.',
+              `🧠 Framework: **${{ needs.classify.outputs.framework }}** — PM: **${{ needs.classify.outputs.package_manager }}**`,
+              `🪪 Dockerfile: **${{ needs.classify.outputs.has_docker }}**, Supabase: **${{ needs.classify.outputs.has_supabase }}**`
+            ].join('\n')
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+  db_migrate:
+    runs-on: ubuntu-latest
+    needs: [classify, audit_build]
+    if: needs.classify.outputs.has_supabase == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install CLIs
+        run: |
+          npm i -g supabase @drizzle-team/drizzle-kit prisma
+      - name: Run migrations (best‑effort)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+        run: |
+          npm run migrate || echo "No migrate script; skipping"

@@ -1,0 +1,93 @@
+name: Release — Tag → Notes → Deploy
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: ${{ vars.NODE_VERSION || '20' }}
+
+jobs:
+  build_release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci || true
+      - run: npm run build --if-present
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-build-${{ github.ref_name }}
+          path: |
+            .next
+            dist
+            build
+            out
+
+  create_github_release:
+    runs-on: ubuntu-latest
+    needs: build_release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate release notes
+        id: notes
+        uses: release-drafter/release-drafter@v6
+        with:
+          config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: false
+
+  deploy_prod:
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [build_release, create_github_release]
+    if: ${{ vars.DEPLOY_TARGET != 'none' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-${{ github.ref_name }}
+          path: ./.ci_artifacts
+
+      - name: Vercel Deploy (Prod)
+        if: ${{ vars.DEPLOY_TARGET == 'vercel' }}
+        run: |
+          npx vercel pull --yes --token ${{ secrets.VERCEL_TOKEN }}
+          npx vercel deploy --prebuilt --prod --token ${{ secrets.VERCEL_TOKEN }} --yes
+
+      - name: Netlify Deploy (Prod)
+        if: ${{ vars.DEPLOY_TARGET == 'netlify' }}
+        run: |
+          npm i -g netlify-cli
+          netlify deploy --auth ${{ secrets.NETLIFY_AUTH_TOKEN }} --site ${{ secrets.NETLIFY_SITE_ID }} --prod
+
+      - name: Azure Web App Deploy (Prod)
+        if: ${{ vars.DEPLOY_TARGET == 'azure' }}
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE }}
+          package: .
+
+      - name: Sentry release (optional)
+        if: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+        run: |
+          npm i -g @sentry/cli
+          export SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
+          sentry-cli releases new ${{ github.ref_name }}
+          sentry-cli releases finalize ${{ github.ref_name }}

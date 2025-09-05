@@ -1,0 +1,69 @@
+name: Auto-Fix and Format
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Install Prettier and ESLint
+        run: |
+          npm install --save-dev prettier eslint eslint-config-prettier
+      
+      - name: Create Prettier config
+        run: |
+          cat > .prettierrc <<EOF
+          {
+            "semi": true,
+            "trailingComma": "es5",
+            "singleQuote": true,
+            "printWidth": 80,
+            "tabWidth": 2
+          }
+          EOF
+      
+      - name: Create ESLint config
+        run: |
+          cat > .eslintrc.json <<EOF
+          {
+            "extends": ["eslint:recommended", "prettier"],
+            "env": {
+              "node": true,
+              "es2022": true
+            },
+            "parserOptions": {
+              "ecmaVersion": "latest"
+            }
+          }
+          EOF
+      
+      - name: Auto-fix with Prettier
+        run: npx prettier --write "**/*.{js,json,md,yml,yaml}" || true
+      
+      - name: Auto-fix with ESLint
+        run: npx eslint --fix "**/*.js" || true
+      
+      - name: Commit fixes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add -A
+          git diff --staged --quiet || git commit -m "🤖 Auto-fix: formatting and linting"
+          git push || true
